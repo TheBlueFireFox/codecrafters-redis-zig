@@ -3,21 +3,22 @@ const resp = @import("resp.zig");
 
 pub const CommandType = enum {
     ping,
+    echo,
 };
 
 pub const FnPtr = fn ([]const resp.Value, []const resp.RespValue, std.mem.Allocator) anyerror!Commands;
 
-pub const CommandError = error{
-    NotSupported,
-};
+pub const CommandError = error{ NotSupported, InvalidFormat };
 
 pub const Commands = union(CommandType) {
     ping: ?*const resp.RespValue,
+    echo: *const resp.RespValue,
 
     pub fn parse(paramsValueRaw: []const resp.Value, paramsRespRaw: []const resp.RespValue, alloc: std.mem.Allocator) anyerror!Commands {
         // * 1\r\n$4\r\nping\r\n
         const map = std.ComptimeStringMap(*const FnPtr, .{
             .{ "PING", &Commands.parsePing },
+            .{ "ECHO", &Commands.parseEcho },
         });
 
         const com = paramsValueRaw[0];
@@ -46,9 +47,14 @@ pub const Commands = union(CommandType) {
         }
     }
 
-    fn parsePing(_: []const resp.Value, _: []const resp.RespValue, _: std.mem.Allocator) anyerror!Commands {
-        // TODO: process PING / PONG values correctly
-        return Commands{ .ping = null };
+    fn parsePing(_: []const resp.Value, r: []const resp.RespValue, _: std.mem.Allocator) anyerror!Commands {
+        if (r.len == 0) return Commands{ .ping = null };
+        return Commands{ .ping = &r[0] };
+    }
+
+    fn parseEcho(_: []const resp.Value, r: []const resp.RespValue, _: std.mem.Allocator) anyerror!Commands {
+        if (r.len == 0) return CommandError.InvalidFormat;
+        return Commands{ .ping = &r[0] };
     }
 };
 

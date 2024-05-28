@@ -7,6 +7,9 @@ pub fn process(req: *const request.Commands, _: std.mem.Allocator) anyerror!resp
         .ping => |v| {
             return ping(v);
         },
+        .echo => |v| {
+            return echo(v);
+        },
     }
 }
 
@@ -16,4 +19,8 @@ fn ping(payload: ?*const resp.RespValue) resp.RespValue {
     }
 
     return resp.RespValue{ .simpleStrings = "PONG" };
+}
+
+fn echo(payload: *const resp.RespValue) resp.RespValue {
+    return payload.*;
 }

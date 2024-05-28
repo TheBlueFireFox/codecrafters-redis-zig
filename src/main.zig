@@ -173,6 +173,10 @@ fn errorHandler(out_buf: *std.ArrayList(u8), err: anyerror) anyerror!usize {
         var e = resp.RespValue{ .simpleErrors = "Invalid Format" };
         try e.write(out_buf);
         return out_buf.items.len;
+    } else if (err == req.CommandError.InvalidFormat) {
+        var e = resp.RespValue{ .simpleErrors = "Invalid Format" };
+        try e.write(out_buf);
+        return out_buf.items.len;
     }
     return err;
 }
