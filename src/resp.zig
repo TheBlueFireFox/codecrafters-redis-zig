@@ -27,41 +27,47 @@ pub const ValueType = enum { string, err, int, array };
 pub const Value = union(ValueType) {
     const Self = @This();
 
-    string: []const u8,
-    err: []const u8,
+    string: RefCounterSlice(u8),
+    err: RefCounterSlice(u8),
     int: i64,
     array: std.ArrayList(Value),
 
     pub fn deinit(self: Self) void {
         switch (self) {
+            .string => |v| {
+                v.deinit();
+            },
+            .err => |v| {
+                v.deinit();
+            },
+            .int => {},
             .array => |arr| {
                 defer arr.deinit();
                 for (arr.items) |a| {
                     a.deinit();
                 }
             },
-            else => {},
         }
     }
 
     pub fn parse(buffer: []const u8, alloc: std.mem.Allocator) anyerror!RespParseReturn {
         // repackage into Value Type (for simpler case handling), although both
         // array will have to be returned
-        const resp = try RespValue.parse(buffer, alloc);
+        var resp = try RespValue.parse(buffer, alloc);
         const vals = try Value.convert(&resp[0], alloc);
         return .{ vals, resp[0], resp[1] };
     }
 
-    fn convert(other: *const RespValue, alloc: std.mem.Allocator) anyerror!Value {
+    fn convert(other: *RespValue, alloc: std.mem.Allocator) anyerror!Value {
         switch (other.*) {
             .simpleStrings => |v| {
-                return .{ .string = v };
+                return .{ .string = v.clone() };
             },
             .bulkStrings => |v| {
-                return .{ .string = v };
+                return .{ .string = v.clone() };
             },
             .simpleErrors => |v| {
-                return .{ .err = v };
+                return .{ .err = v.clone() };
             },
             .int => |v| {
                 return .{ .int = v };
@@ -77,28 +83,156 @@ pub const Value = union(ValueType) {
     }
 };
 
+/// Helper that allows to use the hash map with these types
+pub const RespValueContex = struct {
+    const Self = @This();
+
+    pub fn hash(self: Self, key: RespValue) u64 {
+        const strContext = std.hash_map.StringContext{};
+
+        var h = std.hash.Fnv1a_64.init();
+        switch (key) {
+            .simpleStrings => |v| {
+                h.update(&Self.u64Helper(strContext.hash(v.value)));
+            },
+            .simpleErrors => |v| {
+                h.update(&Self.u64Helper(strContext.hash(v.value)));
+            },
+            .int => |v| {
+                h.update(&Self.u64Helper(@as(u64, @intCast(v))));
+            },
+            .bulkStrings => |v| {
+                h.update(&Self.u64Helper(strContext.hash(v.value)));
+            },
+            .array => |v| {
+                for (v.items) |i| {
+                    h.update(&Self.u64Helper(self.hash(i)));
+                }
+            },
+        }
+        return h.final();
+    }
+
+    fn u64Helper(vRaw: u64) [8]u8 {
+        return @bitCast(vRaw);
+    }
+
+    pub fn eql(self: Self, a: RespValue, b: RespValue) bool {
+        // ugly code -.-
+        const strContext = std.hash_map.StringContext{};
+
+        switch (a) {
+            .simpleStrings => |l| {
+                switch (b) {
+                    .simpleStrings => |r| {
+                        return strContext.eql(l.value, r.value);
+                    },
+                    else => {},
+                }
+            },
+            .simpleErrors => |l| {
+                switch (b) {
+                    .simpleErrors => |r| {
+                        return strContext.eql(l.value, r.value);
+                    },
+                    else => {},
+                }
+            },
+            .int => |l| {
+                switch (b) {
+                    .int => |r| {
+                        return l == r;
+                    },
+                    else => {},
+                }
+            },
+            .bulkStrings => |l| {
+                switch (b) {
+                    .bulkStrings => |r| {
+                        return strContext.eql(l.value, r.value);
+                    },
+                    else => {},
+                }
+            },
+            .array => |larr| {
+                switch (b) {
+                    .array => |rarr| {
+                        var s = true;
+                        for (larr.items, rarr.items) |l, r| {
+                            s = self.eql(l, r);
+                            if (!s) break;
+                        }
+                        return s;
+                    },
+                    else => {},
+                }
+            },
+        }
+
+        return false;
+    }
+};
+
 pub const RespValue = union(RespType) {
     const Self = @This();
     // 	RESP2 	Simple 	        +
-    simpleStrings: []const u8,
+    simpleStrings: RefCounterSlice(u8),
     // 	RESP2 	Simple 	        -
-    simpleErrors: []const u8,
+    simpleErrors: RefCounterSlice(u8),
     // 	RESP2 	Simple 	        :
     int: i64,
     // 	RESP2 	Aggregate 	$
-    bulkStrings: []const u8,
+    bulkStrings: RefCounterSlice(u8),
     // 	RESP2 	Aggregate 	*
     array: std.ArrayList(RespValue),
 
-    pub fn deinit(self: Self) void {
-        switch (self) {
+    pub fn clone(self: *const Self) anyerror!Self {
+        switch (self.*) {
+            .simpleStrings => |v| {
+                return .{ .simpleStrings = v.clone() };
+            },
+            .simpleErrors => |v| {
+                return .{ .simpleErrors = v.clone() };
+            },
+            .bulkStrings => |v| {
+                return .{ .bulkStrings = v.clone() };
+            },
+            .int => |v| {
+                return .{ .int = v };
+            },
+            .array => |arr| {
+                // TODO: fix array clone :(
+                // very expensive
+                const a = try arr.clone();
+                // make sure the counter increments
+                for (a.items) |*v| {
+                    _ = try v.clone();
+                }
+                return .{ .array = a };
+            },
+        }
+    }
+
+    pub fn deinit(self: *const Self) void {
+        switch (self.*) {
+            .simpleStrings => |v| {
+                v.deinit();
+            },
+            .simpleErrors => |v| {
+                v.deinit();
+            },
+            .bulkStrings => |v| {
+                v.deinit();
+            },
+            .int => {
+                // has an int in there -.-
+            },
             .array => |arr| {
                 defer arr.deinit();
                 for (arr.items) |a| {
                     a.deinit();
                 }
             },
-            else => {},
         }
     }
 
@@ -113,17 +247,17 @@ pub const RespValue = union(RespType) {
             // simpleStrings
             '+' => {
                 // +PING\r\n
-                return RespValue.parseSimpleString(buf);
+                return RespValue.parseSimpleString(buf, alloc);
             },
             // simpleErrors
             '-' => {
                 // -Some Error\r\n
-                return RespValue.parseSimpleErrors(buf);
+                return RespValue.parseSimpleErrors(buf, alloc);
             },
             // bulkStrings
             '$' => {
                 // $<length>\r\n<data>\r\n
-                return RespValue.parseBulkString(buf);
+                return RespValue.parseBulkString(buf, alloc);
             },
             // int
             // :[<+|->]<value>\r\n
@@ -142,29 +276,30 @@ pub const RespValue = union(RespType) {
         }
     }
 
-    fn parseSimpleString(buf: []const u8) anyerror!InnerRespParseReturn {
+    fn parseSimpleString(buf: []const u8, alloc: std.mem.Allocator) anyerror!InnerRespParseReturn {
         const untilRaw = findIndex(buf, END_LINE);
         const until = untilRaw orelse return ParsingError.NotCompletedTransmission;
+
         const res = .{
-            .simpleStrings = buf[0..until],
+            .simpleStrings = try RefCounterSlice(u8).fromSlice(buf[0..until], alloc),
         };
         const end = 1 + until + END_LINE.len;
 
         return .{ res, end };
     }
 
-    fn parseSimpleErrors(buf: []const u8) anyerror!InnerRespParseReturn {
+    fn parseSimpleErrors(buf: []const u8, alloc: std.mem.Allocator) anyerror!InnerRespParseReturn {
         const untilRaw = findIndex(buf, END_LINE);
         const until = untilRaw orelse return ParsingError.NotCompletedTransmission;
         const res = .{
-            .simpleErrors = buf[0..until],
+            .simpleErrors = try RefCounterSlice(u8).fromSlice(buf[0..until], alloc),
         };
         const end = 1 + until + END_LINE.len;
 
         return .{ res, end };
     }
 
-    fn parseBulkString(buf: []const u8) anyerror!InnerRespParseReturn {
+    fn parseBulkString(buf: []const u8, alloc: std.mem.Allocator) anyerror!InnerRespParseReturn {
         // no $ at the beginning
         // $4\r\nPING\r\n
 
@@ -183,7 +318,8 @@ pub const RespValue = union(RespType) {
         // add $ to the end offset
         const end = offset + size + 2 + 1;
         if (buf.len <= offset) return ParsingError.NotCompletedTransmission;
-        return .{ .{ .bulkStrings = buf[offset..][0..size] }, end };
+        const str = try RefCounterSlice(u8).fromSlice(buf[offset..][0..size], alloc);
+        return .{ .{ .bulkStrings = str }, end };
     }
 
     fn parseInt(buf: []const u8) anyerror!InnerRespParseReturn {
@@ -242,21 +378,21 @@ pub const RespValue = union(RespType) {
         switch (self.*) {
             .simpleStrings => |v| {
                 try buffer.append('+');
-                try buffer.appendSlice(v);
+                try buffer.appendSlice(v.value);
                 try buffer.appendSlice(END_LINE);
             },
             .simpleErrors => |v| {
                 try buffer.append('-');
-                try buffer.appendSlice(v);
+                try buffer.appendSlice(v.value);
                 try buffer.appendSlice(END_LINE);
             },
             .bulkStrings => |v| {
                 try buffer.append('$');
-                const size = getIntLenUsize(v.len);
+                const size = getIntLenUsize(v.value.len);
                 const b = try buffer.addManyAsSlice(size);
-                _ = std.fmt.formatIntBuf(b, v.len, 10, std.fmt.Case.lower, .{});
+                _ = std.fmt.formatIntBuf(b, v.value.len, 10, std.fmt.Case.lower, .{});
                 try buffer.appendSlice(END_LINE);
-                try buffer.appendSlice(v);
+                try buffer.appendSlice(v.value);
                 try buffer.appendSlice(END_LINE);
             },
             .int => |v| {
@@ -299,6 +435,64 @@ pub fn findIndex(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
+pub fn RefCounterSlice(comptime V: type) type {
+    // poor mans reference counting for a slice
+    return struct {
+        const Self = @This();
+
+        /// Care must be taken to avoid data races when interacting with this field directly.
+        value: []V,
+        /// Don't interact with any of these
+        counter: *usize,
+        mutex: *std.Thread.Mutex,
+        alloc: std.mem.Allocator,
+
+        const LOWER: usize = 0;
+
+        pub fn init(size: usize, alloc: std.mem.Allocator) anyerror!Self {
+            // init and zero everything
+            const value = try alloc.alloc(V, size);
+            for (value) |*v| {
+                v.* = std.mem.zeroes(V);
+            }
+
+            const counter = try alloc.create(usize);
+            const mutex = try alloc.create(std.Thread.Mutex);
+            counter.* = 1;
+            mutex.* = .{};
+            return .{ .value = value, .counter = counter, .alloc = alloc, .mutex = mutex };
+        }
+
+        pub fn fromSlice(slice: []const V, alloc: std.mem.Allocator) anyerror!Self {
+            const s = try Self.init(slice.len, alloc);
+            std.mem.copyForwards(V, s.value, slice);
+            return s;
+        }
+
+        pub fn clone(self: *const Self) Self {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.counter.* += 1;
+            return self.*;
+        }
+
+        pub fn deinit(self: *const Self) void {
+            self.mutex.lock();
+            self.counter.* -= 1;
+
+            if (self.counter.* > Self.LOWER) {
+                self.mutex.unlock();
+                return;
+            }
+
+            self.mutex.unlock();
+            self.alloc.free(self.value);
+            self.alloc.destroy(self.counter);
+            self.alloc.destroy(self.mutex);
+        }
+    };
+}
+
 const tallocator = std.testing.allocator;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
@@ -337,7 +531,8 @@ test "don't find needle in haystack" {
 test "writeSimpleString" {
     const expected = "+PONG\r\n";
 
-    const pong = RespValue{ .simpleStrings = "PONG" };
+    const pong = RespValue{ .simpleStrings = try RefCounterSlice(u8).fromSlice("PONG", tallocator) };
+    defer pong.deinit();
 
     var buffer = std.ArrayList(u8).init(tallocator);
     defer buffer.deinit();
@@ -350,7 +545,8 @@ test "writeSimpleString" {
 test "writeSimpleErrors" {
     const expected = "-Unable to Process\r\n";
 
-    const pong = RespValue{ .simpleErrors = "Unable to Process" };
+    const pong = RespValue{ .simpleErrors = try RefCounterSlice(u8).fromSlice("Unable to Process", tallocator) };
+    defer pong.deinit();
     var buffer = std.ArrayList(u8).init(tallocator);
     defer buffer.deinit();
     try pong.write(&buffer);
@@ -368,11 +564,12 @@ test "parseSimpleString" {
     try buffer.appendSlice(input);
 
     const res = try RespValue.parse(buffer.items, tallocator);
+    defer res[0].deinit();
 
     try expectEqual(res[1], input.len);
     switch (res[0]) {
         .simpleStrings => |v| {
-            try expectEqualSlices(u8, exp, v);
+            try expectEqualSlices(u8, exp, v.value);
         },
         else => {
             try expect(false);
@@ -389,11 +586,12 @@ test "parse simple error" {
     try buffer.appendSlice(input);
 
     const res = try RespValue.parse(buffer.items, tallocator);
+    defer res[0].deinit();
 
     try expectEqual(res[1], input.len);
     switch (res[0]) {
         .simpleErrors => |v| {
-            try expectEqualSlices(u8, exp, v);
+            try expectEqualSlices(u8, exp, v.value);
         },
         else => {
             @panic("invalid type");
@@ -410,11 +608,12 @@ test "parse bulk string" {
     try buffer.appendSlice(input);
 
     const res = try RespValue.parse(buffer.items, tallocator);
+    defer res[0].deinit();
 
     try expectEqual(res[1], input.len);
     switch (res[0]) {
         .bulkStrings => |v| {
-            try expectEqualSlices(u8, exp, v);
+            try expectEqualSlices(u8, exp, v.value);
         },
         else => {
             @panic("invalid type");
@@ -425,7 +624,9 @@ test "parse bulk string" {
 test "write bulk strings" {
     const expected = "$4\r\nPING\r\n";
 
-    const pong = RespValue{ .bulkStrings = "PING" };
+    const pong = RespValue{ .bulkStrings = try RefCounterSlice(u8).fromSlice("PING", tallocator) };
+    defer pong.deinit();
+
     var buffer = std.ArrayList(u8).init(tallocator);
     defer buffer.deinit();
     try pong.write(&buffer);
@@ -464,6 +665,7 @@ test "parse int positive with sing" {
     try buffer.appendSlice(input);
 
     const res = try RespValue.parse(buffer.items, tallocator);
+    defer res[0].deinit();
 
     try expectEqual(input.len, res[1]);
     switch (res[0]) {
@@ -485,6 +687,7 @@ test "parse int negative" {
     try buffer.appendSlice(input);
 
     const res = try RespValue.parse(buffer.items, tallocator);
+    defer res[0].deinit();
 
     try expectEqual(input.len, res[1]);
     switch (res[0]) {
@@ -501,6 +704,8 @@ test "write int values positive no sign" {
     const expected = ":4\r\n";
 
     const pong = RespValue{ .int = 4 };
+    defer pong.deinit();
+
     var buffer = std.ArrayList(u8).init(tallocator);
     defer buffer.deinit();
     try pong.write(&buffer);
@@ -529,7 +734,7 @@ test "parse array empty" {
     defer buffer.deinit();
     try buffer.appendSlice(input);
 
-    const res = try RespValue.parse(buffer.items, tallocator);
+    var res = try RespValue.parse(buffer.items, tallocator);
     defer res[0].deinit();
 
     try expectEqual(input.len, res[1]);
@@ -552,7 +757,7 @@ test "parse array single element" {
     defer buffer.deinit();
     try buffer.appendSlice(input);
 
-    const res = try RespValue.parse(buffer.items, tallocator);
+    var res = try RespValue.parse(buffer.items, tallocator);
     defer res[0].deinit();
 
     try expectEqual(input.len, res[1]);
@@ -563,7 +768,7 @@ test "parse array single element" {
             for (arr, 0..) |v, i| {
                 switch (v) {
                     .bulkStrings => |inner| {
-                        try expectEqualSlices(u8, inner, exp[i]);
+                        try expectEqualSlices(u8, exp[i], inner.value);
                     },
                     else => {
                         @panic("invalid type");
@@ -586,7 +791,7 @@ test "parse array multiple element" {
     defer buffer.deinit();
     try buffer.appendSlice(input);
 
-    const res = try RespValue.parse(buffer.items, tallocator);
+    var res = try RespValue.parse(buffer.items, tallocator);
     defer res[0].deinit();
 
     try expectEqual(input.len, res[1]);
@@ -597,7 +802,7 @@ test "parse array multiple element" {
             for (arr, exp[0..]) |g, e| {
                 switch (g) {
                     .bulkStrings => |inner| {
-                        try expectEqualSlices(u8, inner, e[0..]);
+                        try expectEqualSlices(u8, e[0..], inner.value);
                     },
                     else => {
                         @panic("invalid type");
@@ -621,7 +826,7 @@ test "parse array multiple element different types" {
     defer buffer.deinit();
     try buffer.appendSlice(input);
 
-    const res = try RespValue.parse(buffer.items, tallocator);
+    var res = try RespValue.parse(buffer.items, tallocator);
     defer res[0].deinit();
 
     try expectEqual(input.len, res[1]);
@@ -632,7 +837,7 @@ test "parse array multiple element different types" {
             for (arr[0..2], exp[0..2]) |g, e| {
                 switch (g) {
                     .bulkStrings => |inner| {
-                        try expectEqualSlices(u8, inner, e[0..]);
+                        try expectEqualSlices(u8, e[0..], inner.value);
                     },
                     else => {
                         @panic("invalid type");
@@ -683,4 +888,24 @@ test "write array single " {
 
     try expectEqual(buffer.items.len, expected.len);
     try expectEqualSlices(u8, buffer.items, expected);
+}
+
+test "ref counter" {
+    var ref = try RefCounterSlice(u8).init(1, tallocator);
+    ref.value[0] = 5;
+
+    try expectEqual(ref.counter.*, 1);
+    try expectEqual(ref.value[0], 5);
+    var vClone = ref.clone();
+    try expectEqual(vClone.value[0], 5);
+    vClone.value[0] = 6;
+    try expectEqual(ref.value[0], 6);
+
+    try expectEqual(ref.counter.*, 2);
+    try expectEqual(vClone.counter.*, 2);
+
+    ref.deinit();
+    try expectEqual(ref.counter.*, 1);
+
+    vClone.deinit();
 }

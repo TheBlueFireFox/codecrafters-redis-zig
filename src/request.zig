@@ -4,21 +4,32 @@ const resp = @import("resp.zig");
 pub const CommandType = enum {
     ping,
     echo,
+    get,
+    set,
 };
 
 pub const FnPtr = fn ([]const resp.Value, []const resp.RespValue, std.mem.Allocator) anyerror!Commands;
 
 pub const CommandError = error{ NotSupported, InvalidFormat };
 
+pub const SetCommand = struct {
+    key: resp.RespValue,
+    value: resp.RespValue,
+};
+
 pub const Commands = union(CommandType) {
-    ping: ?*const resp.RespValue,
-    echo: *const resp.RespValue,
+    ping: ?resp.RespValue,
+    echo: resp.RespValue,
+    get: resp.RespValue,
+    set: SetCommand,
 
     pub fn parse(paramsValueRaw: []const resp.Value, paramsRespRaw: []const resp.RespValue, alloc: std.mem.Allocator) anyerror!Commands {
         // * 1\r\n$4\r\nping\r\n
         const map = std.ComptimeStringMap(*const FnPtr, .{
             .{ "PING", &Commands.parsePing },
             .{ "ECHO", &Commands.parseEcho },
+            .{ "GET", &Commands.parseGet },
+            .{ "SET", &Commands.parseSet },
         });
 
         const com = paramsValueRaw[0];
@@ -28,12 +39,12 @@ pub const Commands = union(CommandType) {
 
         switch (com) {
             .string => |vRaw| {
-                // COPY: because of const nature
+                // COPY: because of otherwise a unwanted mutation occures
                 // upper case so that we can compare it with the map
 
-                const v = try alloc.alloc(u8, vRaw.len);
+                const v = try alloc.alloc(u8, vRaw.value.len);
                 defer alloc.free(v);
-                std.mem.copyForwards(u8, v, vRaw);
+                std.mem.copyForwards(u8, v, vRaw.value);
                 toUpper(v);
 
                 const fnPtr = map.get(v) orelse return CommandError.NotSupported;
@@ -49,12 +60,23 @@ pub const Commands = union(CommandType) {
 
     fn parsePing(_: []const resp.Value, r: []const resp.RespValue, _: std.mem.Allocator) anyerror!Commands {
         if (r.len == 0) return Commands{ .ping = null };
-        return Commands{ .ping = &r[0] };
+        return Commands{ .ping = try r[0].clone() };
     }
 
     fn parseEcho(_: []const resp.Value, r: []const resp.RespValue, _: std.mem.Allocator) anyerror!Commands {
         if (r.len == 0) return CommandError.InvalidFormat;
-        return Commands{ .ping = &r[0] };
+        return Commands{ .ping = try r[0].clone() };
+    }
+
+    fn parseSet(_: []const resp.Value, vals: []const resp.RespValue, _: std.mem.Allocator) anyerror!Commands {
+        if (vals.len < 2) return CommandError.InvalidFormat;
+
+        return .{ .set = .{ .key = try vals[0].clone(), .value = try vals[1].clone() } };
+    }
+
+    fn parseGet(_: []const resp.Value, vals: []const resp.RespValue, _: std.mem.Allocator) anyerror!Commands {
+        if (vals.len < 1) return CommandError.InvalidFormat;
+        return .{ .get = try vals[0].clone() };
     }
 };
 

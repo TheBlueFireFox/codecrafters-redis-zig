@@ -5,6 +5,7 @@ const net = std.net;
 const resp = @import("resp.zig");
 const req = @import("request.zig");
 const processing = @import("processing.zig");
+const db = @import("db.zig");
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
@@ -22,18 +23,23 @@ pub fn main() !void {
     });
     defer listener.deinit();
 
+    var dmap = db.DataMap.init(allocator);
+    defer dmap.deinit();
+
     var threads = [_]std.Thread{};
-    var pool: std.Thread.Pool = .{ .allocator = allocator, .threads = &threads };
+    var pool = std.Thread.Pool{ .allocator = allocator, .threads = &threads };
     try pool.init(.{ .allocator = allocator, .n_jobs = 8 });
     defer pool.deinit();
 
     while (true) {
         const connection = try listener.accept();
-        try pool.spawn(processConnection, .{ConnectionOptions{ .conn = connection, .alloc = allocator }});
+
+        // SAFETY: this ptr is safe at it will live for as long as the program does
+        try pool.spawn(processConnection, .{ConnectionOptions{ .conn = connection, .alloc = allocator, .db = &dmap }});
     }
 }
 
-const ConnectionOptions = struct { conn: net.Server.Connection, alloc: std.mem.Allocator };
+const ConnectionOptions = struct { conn: net.Server.Connection, alloc: std.mem.Allocator, db: *db.DataMap };
 
 fn processConnection(co: ConnectionOptions) void {
     innerProcessConnection(co) catch {
@@ -44,6 +50,7 @@ fn processConnection(co: ConnectionOptions) void {
 fn innerProcessConnection(co: ConnectionOptions) anyerror!void {
     const conn = co.conn;
     const alloc = co.alloc;
+    const database = co.db;
 
     defer conn.stream.close();
     const stdout = std.io.getStdOut().writer();
@@ -72,7 +79,7 @@ fn innerProcessConnection(co: ConnectionOptions) anyerror!void {
         // write back to main buffer
         try connectionBuffer.appendSlice(innerBuffer[0..loaded]);
 
-        _ = process(connectionBuffer.items, &resultBuffer, alloc) catch |err| {
+        _ = process(connectionBuffer.items, &resultBuffer, alloc, database) catch |err| {
             if (err != resp.ParsingError.NotCompletedTransmission) return err;
             // we need to loop and process everything now
             continue;
@@ -82,10 +89,10 @@ fn innerProcessConnection(co: ConnectionOptions) anyerror!void {
     }
 }
 
-fn process(buf: []const u8, outBuf: *std.ArrayList(u8), alloc: std.mem.Allocator) anyerror!usize {
+fn process(buf: []const u8, outBuf: *std.ArrayList(u8), alloc: std.mem.Allocator, database: *db.DataMap) anyerror!usize {
     // struct { std.ArrayList(Value), std.ArrayList(RespValue), usize }
-    const val = resp.Value.parse(buf, alloc) catch |err| {
-        return try errorHandler(outBuf, err);
+    var val = resp.Value.parse(buf, alloc) catch |err| {
+        return try errorHandler(outBuf, err, alloc);
     };
 
     defer val[0].deinit();
@@ -98,12 +105,12 @@ fn process(buf: []const u8, outBuf: *std.ArrayList(u8), alloc: std.mem.Allocator
     defer fRVal.deinit();
 
     const request = req.Commands.parse(fVal.arr.items, fRVal.arr.items, alloc) catch |err| {
-        return try errorHandler(outBuf, err);
+        return try errorHandler(outBuf, err, alloc);
     };
 
     // process command
-    const result = processing.process(&request, alloc) catch |err| {
-        return try errorHandler(outBuf, err);
+    const result = processing.process(request, alloc, database) catch |err| {
+        return try errorHandler(outBuf, err, alloc);
     };
 
     try result.write(outBuf);
@@ -160,25 +167,24 @@ fn fixRValue(vals: *const resp.RespValue, alloc: std.mem.Allocator) anyerror!Fix
     }
 }
 
-fn errorHandler(out_buf: *std.ArrayList(u8), err: anyerror) anyerror!usize {
+fn errorHandler(outBuf: *std.ArrayList(u8), err: anyerror, alloc: std.mem.Allocator) anyerror!usize {
     if (err == resp.ParsingError.NotSupported) {
-        var e = resp.RespValue{ .simpleErrors = "Not Supported Type during inital Text Parsing" };
-        try e.write(out_buf);
-        return out_buf.items.len;
+        return errorHandlerHelper("Not Supported Type during inital Text Parsing", outBuf, alloc);
     } else if (err == req.CommandError.NotSupported) {
-        var e = resp.RespValue{ .simpleErrors = "Not Supported Type during request Command Parsing" };
-        try e.write(out_buf);
-        return out_buf.items.len;
+        return errorHandlerHelper("Not Supported Type during request Command Parsing", outBuf, alloc);
     } else if (err == resp.ParsingError.InvalidFormat) {
-        var e = resp.RespValue{ .simpleErrors = "Invalid Format" };
-        try e.write(out_buf);
-        return out_buf.items.len;
+        return errorHandlerHelper("Invalid Format", outBuf, alloc);
     } else if (err == req.CommandError.InvalidFormat) {
-        var e = resp.RespValue{ .simpleErrors = "Invalid Format" };
-        try e.write(out_buf);
-        return out_buf.items.len;
+        return errorHandlerHelper("Invalid Format", outBuf, alloc);
     }
     return err;
+}
+
+fn errorHandlerHelper(str: []const u8, outBuf: *std.ArrayList(u8), alloc: std.mem.Allocator) anyerror!usize {
+    var e = resp.RespValue{ .simpleErrors = try resp.RefCounterSlice(u8).fromSlice(str, alloc) };
+    defer e.deinit();
+    try e.write(outBuf);
+    return outBuf.items.len;
 }
 
 // hack so that all tests are run
@@ -196,8 +202,10 @@ test "test full ping simple string" {
     const expect = "+PONG\r\n";
     var outBuf = std.ArrayList(u8).init(talloc);
     defer outBuf.deinit();
+    var database = db.DataMap.init(talloc);
+    defer database.deinit();
 
-    const resultSize = try process(input[0..], &outBuf, talloc);
+    const resultSize = try process(input[0..], &outBuf, talloc, &database);
     try expectEqual(resultSize, expect.len);
     try expectEqualSlices(u8, expect, outBuf.items);
 }
@@ -207,8 +215,10 @@ test "test full ping bulk string" {
     const expect = "+PONG\r\n";
     var outBuf = std.ArrayList(u8).init(talloc);
     defer outBuf.deinit();
+    var database = db.DataMap.init(talloc);
+    defer database.deinit();
 
-    const resultSize = try process(input[0..], &outBuf, talloc);
+    const resultSize = try process(input[0..], &outBuf, talloc, &database);
     try expectEqual(resultSize, expect.len);
     try expectEqualSlices(u8, expect, outBuf.items);
 }
