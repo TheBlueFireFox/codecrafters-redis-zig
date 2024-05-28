@@ -22,14 +22,30 @@ pub fn main() !void {
     });
     defer listener.deinit();
 
+    var threads = [_]std.Thread{};
+    var pool: std.Thread.Pool = .{ .allocator = allocator, .threads = &threads };
+    try pool.init(.{ .allocator = allocator, .n_jobs = 8 });
+    defer pool.deinit();
+
     while (true) {
         const connection = try listener.accept();
-        defer connection.stream.close();
-        try processConnection(connection, allocator);
+        try pool.spawn(processConnection, .{ConnectionOptions{ .conn = connection, .alloc = allocator }});
     }
 }
 
-fn processConnection(conn: net.Server.Connection, alloc: std.mem.Allocator) anyerror!void {
+const ConnectionOptions = struct { conn: net.Server.Connection, alloc: std.mem.Allocator };
+
+fn processConnection(co: ConnectionOptions) void {
+    innerProcessConnection(co) catch {
+        // we cannot do anything about the error anymore
+        @panic("An error happend");
+    };
+}
+fn innerProcessConnection(co: ConnectionOptions) anyerror!void {
+    const conn = co.conn;
+    const alloc = co.alloc;
+
+    defer conn.stream.close();
     const stdout = std.io.getStdOut().writer();
 
     // setup buffers (no reuse for now)
