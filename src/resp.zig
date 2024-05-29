@@ -3,34 +3,20 @@ const math = std.math;
 
 pub const END_LINE = "\r\n";
 
-pub const RespType = enum {
-    // 	RESP2 	Simple 	        +
-    simpleStrings,
-    // 	RESP2 	Simple 	        -
-    simpleErrors,
-    // 	RESP2 	Simple 	        :
-    int,
-    // 	RESP2 	Aggregate 	$
-    bulkStrings,
-    // 	RESP2 	Aggregate 	*
-    array,
-};
-
 pub const ParsingError = error{ NotSupported, EndLineNotFound, NotCompletedTransmission, InvalidFormat };
 
 pub const RespParseReturn = struct { Value, RespValue, usize };
 
 const InnerRespParseReturn = struct { RespValue, usize };
 
-pub const ValueType = enum { string, err, int, array };
-
-pub const Value = union(ValueType) {
+pub const Value = union(enum) {
     const Self = @This();
 
     string: RefCounterSlice(u8),
     err: RefCounterSlice(u8),
     int: i64,
     array: std.ArrayList(Value),
+    nullString: void,
 
     pub fn deinit(self: Self) void {
         switch (self) {
@@ -47,6 +33,7 @@ pub const Value = union(ValueType) {
                     a.deinit();
                 }
             },
+            .nullString => {},
         }
     }
 
@@ -79,6 +66,9 @@ pub const Value = union(ValueType) {
                 }
                 return .{ .array = arr };
             },
+            .nullString => {
+                return .{ .nullString = void{} };
+            },
         }
     }
 };
@@ -108,6 +98,10 @@ pub const RespValueContex = struct {
                 for (v.items) |i| {
                     h.update(&Self.u64Helper(self.hash(i)));
                 }
+            },
+            .nullString => {
+                // this should never even exist in the DB (please)
+                h.update(&Self.u64Helper(~@as(u64, 0)));
             },
         }
         return h.final();
@@ -167,13 +161,21 @@ pub const RespValueContex = struct {
                     else => {},
                 }
             },
+            .nullString => {
+                switch (b) {
+                    .nullString => {
+                        return true;
+                    },
+                    else => {},
+                }
+            },
         }
 
         return false;
     }
 };
 
-pub const RespValue = union(RespType) {
+pub const RespValue = union(enum) {
     const Self = @This();
     // 	RESP2 	Simple 	        +
     simpleStrings: RefCounterSlice(u8),
@@ -185,6 +187,8 @@ pub const RespValue = union(RespType) {
     bulkStrings: RefCounterSlice(u8),
     // 	RESP2 	Aggregate 	*
     array: std.ArrayList(RespValue),
+    // 	RESP2 	Aggregate 	$
+    nullString: void,
 
     pub fn clone(self: *const Self) anyerror!Self {
         switch (self.*) {
@@ -210,6 +214,9 @@ pub const RespValue = union(RespType) {
                 }
                 return .{ .array = a };
             },
+            .nullString => {
+                return .{ .nullString = void{} };
+            },
         }
     }
 
@@ -232,6 +239,9 @@ pub const RespValue = union(RespType) {
                 for (arr.items) |a| {
                     a.deinit();
                 }
+            },
+            .nullString => {
+                // nothing to do
             },
         }
     }
@@ -412,6 +422,9 @@ pub const RespValue = union(RespType) {
                 for (arr.items) |v| {
                     try v.write(buffer);
                 }
+            },
+            .nullString => {
+                try buffer.appendSlice("$-1\r\n"[0..]);
             },
         }
     }

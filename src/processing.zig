@@ -32,13 +32,13 @@ fn echo(payload: resp.RespValue) anyerror!resp.RespValue {
     return payload.clone();
 }
 
-fn get(key: resp.RespValue, database: *db.DataMap, alloc: std.mem.Allocator) anyerror!resp.RespValue {
+fn get(key: resp.RespValue, database: *db.DataMap, _: std.mem.Allocator) anyerror!resp.RespValue {
     const value = try database.get(&key);
-    return value orelse return errorHandler("missing key", alloc);
+    return value orelse return .{ .nullString = void{} };
 }
 
 fn set(com: request.SetCommand, database: *db.DataMap, alloc: std.mem.Allocator) anyerror!resp.RespValue {
-    const value = try database.set(com.key, com.value);
+    const value = try database.set(com.key, com.value, com.lives);
     if (value) |old| old.deinit();
     return resp.RespValue{ .simpleStrings = try refFromSlice("OK", alloc) };
 }

@@ -15,6 +15,7 @@ pub const CommandError = error{ NotSupported, InvalidFormat };
 pub const SetCommand = struct {
     key: resp.RespValue,
     value: resp.RespValue,
+    lives: ?i64,
 };
 
 pub const Commands = union(CommandType) {
@@ -68,10 +69,53 @@ pub const Commands = union(CommandType) {
         return Commands{ .ping = try r[0].clone() };
     }
 
-    fn parseSet(_: []const resp.Value, vals: []const resp.RespValue, _: std.mem.Allocator) anyerror!Commands {
+    fn parseSet(valsParsed: []const resp.Value, vals: []const resp.RespValue, alloc: std.mem.Allocator) anyerror!Commands {
         if (vals.len < 2) return CommandError.InvalidFormat;
+        var res = SetCommand{ .key = try vals[0].clone(), .value = try vals[1].clone(), .lives = null };
+        if (vals.len == 2) {
+            return .{ .set = res };
+        }
+        var comRaw: []u8 = &[0]u8{};
+        switch (valsParsed[2]) {
+            .string => |v| {
+                comRaw = v.value;
+            },
+            else => {
+                return CommandError.InvalidFormat;
+            },
+        }
+        var livesFor: i64 = 0;
+        switch (valsParsed[3]) {
+            .int => |v| {
+                livesFor = v;
+            },
+            .string => |v| {
+                const val = std.fmt.parseInt(i64, v.value, 10) catch {
+                    return CommandError.InvalidFormat;
+                };
+                livesFor = val;
+            },
+            else => {
+                return CommandError.InvalidFormat;
+            },
+        }
 
-        return .{ .set = .{ .key = try vals[0].clone(), .value = try vals[1].clone() } };
+        // COPY: to make my life easier
+        const com = try alloc.alloc(u8, comRaw.len);
+        defer alloc.free(com);
+        std.mem.copyForwards(u8, com, comRaw);
+        toUpper(com);
+
+        if (std.mem.eql(u8, com, "EX")) {
+            // from seconds to milliseconds
+            livesFor *= 1000;
+        } else if (!std.mem.eql(u8, com, "PX")) {
+            // not supported
+            return CommandError.NotSupported;
+        }
+        res.lives = livesFor;
+
+        return .{ .set = res };
     }
 
     fn parseGet(_: []const resp.Value, vals: []const resp.RespValue, _: std.mem.Allocator) anyerror!Commands {
